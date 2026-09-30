@@ -47,6 +47,8 @@ import com.egm.stellio.subscription.utils.toUri
 import com.egm.stellio.subscription.utils.toZonedDateTime
 import io.r2dbc.postgresql.codec.Json
 import kotlinx.coroutines.reactive.awaitFirst
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.locationtech.jts.geom.Geometry
 import org.springframework.data.r2dbc.core.R2dbcEntityTemplate
 import org.springframework.data.r2dbc.core.delete
@@ -60,6 +62,8 @@ import org.springframework.transaction.annotation.Transactional
 import java.net.URI
 import java.time.Instant
 import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.util.concurrent.ConcurrentHashMap
 
 @Component
 class SubscriptionService(
@@ -82,8 +86,41 @@ class SubscriptionService(
         LEFT JOIN geometry_query on subscription.id = geometry_query.subscription_id
     """.trimIndent()
 
+    private val expandedEntityUpdatedTriggers = NotificationTrigger.expandEntityUpdated().split(",")
+
+    // In-memory cache of the subscription table. getMatchingSubscriptions runs once per
+    // incoming entity event; re-materializing the full table each time (allToMappedList +
+    // rowToSubscription) is what saturated the R2DBC pool and OOM'd the JVM (7.6M retained
+    // Subscription objects per MAT). Load once, filter in memory, invalidate/update on change.
+    private val subscriptionsCache = ConcurrentHashMap<URI, Subscription>()
+    @Volatile
+    private var cacheLoaded = false
+    private val cacheMutex = Mutex()
+
+    private suspend fun ensureSubscriptionsCacheLoaded() {
+        if (cacheLoaded) return
+        cacheMutex.withLock {
+            if (cacheLoaded) return@withLock
+            getAllSubscriptions().forEach { subscriptionsCache[it.id] = it }
+            cacheLoaded = true
+        }
+    }
+
+    private suspend fun invalidateSubscriptionsCache() {
+        cacheMutex.withLock {
+            subscriptionsCache.clear()
+            cacheLoaded = false
+        }
+    }
+
+    private suspend fun getAllSubscriptions(): List<Subscription> =
+        databaseClient.sql(subscriptionBaseQuery)
+            .allToMappedList { rowToSubscription(it) }
+            .mergeEntitySelectorsOnSubscriptions()
+
     @Transactional
-    suspend fun upsert(subscription: Subscription, sub: Sub): Either<APIException, Unit> = either {
+    suspend fun upsert(subscription: Subscription, sub: Sub): Either<APIException, Unit> {
+        val result = either {
         val endpoint = subscription.notification.endpoint
         val insertStatement =
             """
@@ -160,6 +197,9 @@ class SubscriptionService(
         subscription.entities?.let {
             upsertEntitiesSelector(subscription.id, it).bind()
         }
+        }
+        invalidateSubscriptionsCache()
+        return result
     }
 
     suspend fun exists(subscriptionId: URI): Either<APIException, Boolean> =
@@ -280,10 +320,13 @@ class SubscriptionService(
             }
     }
 
-    suspend fun delete(subscriptionId: URI): Either<APIException, Unit> =
-        r2dbcEntityTemplate.delete<Subscription>()
+    suspend fun delete(subscriptionId: URI): Either<APIException, Unit> {
+        val result = r2dbcEntityTemplate.delete<Subscription>()
             .matching(query(where("id").`is`(subscriptionId)))
             .execute()
+        invalidateSubscriptionsCache()
+        return result
+    }
 
     suspend fun deleteEntitySelector(subscriptionId: URI): Either<APIException, Unit> =
         databaseClient.sql(
@@ -331,34 +374,60 @@ class SubscriptionService(
         updatedAttribute: Pair<ExpandedTerm, URI?>?,
         notificationTrigger: NotificationTrigger
     ): List<Subscription> {
-        val selectStatement =
-            """
-            $subscriptionBaseQuery
-            WHERE is_active
-            AND ( expires_at is null OR expires_at >= :date )
-            AND time_interval IS NULL
-            AND ( throttling IS NULL 
-                OR (last_notification + throttling * INTERVAL '1 second') < :date
-                OR last_notification IS NULL)
-            AND (cooldown is NULL
-                OR (status = 'FAILED' AND (last_failure + cooldown * INTERVAL '1 millisecond') < :date)
-                OR status = 'OK')
-            ${
-                if (updatedAttribute != null)
-                    "AND (string_to_array(watched_attributes, ',') && '{ ${updatedAttribute.first} }'" +
-                        "  OR watched_attributes IS NULL)"
-                else ""
-            }
-            AND CASE
-                WHEN notification_trigger && '{ entityUpdated }'
-                    THEN notification_trigger || '{ ${NotificationTrigger.expandEntityUpdated()} }' && '{ ${notificationTrigger.notificationTrigger} }'
-                ELSE notification_trigger && '{ ${notificationTrigger.notificationTrigger} }'
-            END
-            """.trimIndent()
-        return databaseClient.sql(selectStatement)
-            .bind("date", ngsiLdDateTime())
-            .allToMappedList { rowToSubscription(it) }
-            .mergeEntitySelectorsOnSubscriptions()
+        ensureSubscriptionsCacheLoaded()
+        val now = ngsiLdDateTime()
+        return subscriptionsCache.values.filter { subscription ->
+            matchesDynamicFilters(subscription, updatedAttribute, notificationTrigger, now)
+        }
+    }
+
+    private fun matchesDynamicFilters(
+        subscription: Subscription,
+        updatedAttribute: Pair<ExpandedTerm, URI?>?,
+        notificationTrigger: NotificationTrigger,
+        now: ZonedDateTime
+    ): Boolean =
+        subscription.isActive &&
+            (subscription.expiresAt == null || !subscription.expiresAt.isBefore(now)) &&
+            subscription.timeInterval == null &&
+            isNotThrottled(subscription, now) &&
+            isNotCoolingDown(subscription, now) &&
+            matchesWatchedAttribute(subscription, updatedAttribute) &&
+            matchesNotificationTrigger(subscription.notificationTrigger, notificationTrigger)
+
+    private fun isNotThrottled(subscription: Subscription, now: ZonedDateTime): Boolean {
+        val throttling = subscription.throttling ?: return true
+        val lastNotification = subscription.notification.lastNotification ?: return true
+        return lastNotification.plusSeconds(throttling.toLong()).isBefore(now)
+    }
+
+    private fun isNotCoolingDown(subscription: Subscription, now: ZonedDateTime): Boolean {
+        val cooldown = subscription.notification.endpoint.cooldown ?: return true
+        return when (subscription.notification.status) {
+            NotificationParams.StatusType.OK -> true
+            NotificationParams.StatusType.FAILED ->
+                subscription.notification.lastFailure?.plusMillis(cooldown.toLong())?.isBefore(now) ?: false
+            null -> false
+        }
+    }
+
+    private fun matchesWatchedAttribute(
+        subscription: Subscription,
+        updatedAttribute: Pair<ExpandedTerm, URI?>?
+    ): Boolean =
+        updatedAttribute == null ||
+            subscription.watchedAttributes == null ||
+            updatedAttribute.first in subscription.watchedAttributes
+
+    private fun matchesNotificationTrigger(
+        subscriptionTriggers: List<String>,
+        notificationTrigger: NotificationTrigger
+    ): Boolean {
+        val inputTrigger = notificationTrigger.notificationTrigger
+        return if (subscriptionTriggers.contains(NotificationTrigger.ENTITY_UPDATED.notificationTrigger))
+            (subscriptionTriggers + expandedEntityUpdatedTriggers).contains(inputTrigger)
+        else
+            subscriptionTriggers.contains(inputTrigger)
     }
 
     suspend fun getMatchingSubscriptions(
@@ -448,11 +517,29 @@ class SubscriptionService(
             .set("last_notification", notification.notifiedAt)
             .set(lastStatusName, notification.notifiedAt)
 
-        return r2dbcEntityTemplate.update(
+        val result = r2dbcEntityTemplate.update(
             query(where("id").`is`(subscription.id)),
             updateStatement,
             Subscription::class.java
         ).awaitFirst()
+
+        updateCachedSubscription(subscription, notification, success)
+
+        return result
+    }
+
+    private fun updateCachedSubscription(subscription: Subscription, notification: Notification, success: Boolean) {
+        if (!cacheLoaded) return
+        val newStatus = if (success) NotificationParams.StatusType.OK else NotificationParams.StatusType.FAILED
+        subscriptionsCache[subscription.id] = subscription.copy(
+            notification = subscription.notification.copy(
+                status = newStatus,
+                timesSent = subscription.notification.timesSent + 1,
+                lastNotification = notification.notifiedAt,
+                lastSuccess = if (success) notification.notifiedAt else subscription.notification.lastSuccess,
+                lastFailure = if (!success) notification.notifiedAt else subscription.notification.lastFailure
+            )
+        )
     }
 
     private val rowToSubscription: ((Map<String, Any>) -> Subscription) = { row ->
